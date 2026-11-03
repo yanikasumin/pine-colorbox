@@ -1,0 +1,166 @@
+//@version=6
+// =============================================================================
+// Colorbox — Gap Box Indicator
+// -----------------------------------------------------------------------------
+// Detects price gaps, draws a box over each gap zone, and manages the boxes:
+//   * the box is removed as soon as the gap is fully filled,
+//   * the box color changes when price reaches the gap's midline (50% level),
+//   * an unfilled box is removed after a configurable number of bars.
+// All major parameters (gap definition, minimum gap size, lifetime, maximum
+// number of boxes, colors, midline) are exposed as inputs.
+//
+// Gap definition (default): the gap is measured between the current candle and
+// the candle from 2 bars back — e.g. a bullish gap exists when the current
+// low is above the high of the candle 2 bars ago. A "consecutive candles"
+// mode (current candle vs. the immediately previous candle) is also provided.
+// =============================================================================
+indicator("Colorbox — Gap Box Indicator", shorttitle = "Colorbox", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpD = "1. Detection"
+gapMode    = input.string("Previous 2 candles", "Gap is measured between", options = ["Previous 2 candles", "Consecutive candles"], group = grpD,
+     tooltip = "Previous 2 candles: current candle vs. the candle 2 bars back (the gap zone spans the in-between candle). Consecutive candles: current candle vs. the immediately previous candle.")
+showBull   = input.bool(true,  "Show bullish gaps (gap up)",   group = grpD)
+showBear   = input.bool(true,  "Show bearish gaps (gap down)", group = grpD)
+confirmBar = input.bool(false, "Detect on bar close only",     group = grpD,
+     tooltip = "On: a gap is evaluated with barstate.isconfirmed when the newer candle closes, using that candle's final values (no one-bar detection delay). Off: evaluated live on the forming candle (the box may appear intra-bar).")
+minMode    = input.string("Percent", "Minimum gap size — mode", options = ["Percent", "Price", "ATR multiple"], group = grpD)
+minVal     = input.float(0.0, "Minimum gap size — value", minval = 0.0, group = grpD,
+     tooltip = "Percent: % of the older candle's edge price. Price: absolute price units. ATR multiple: multiple of the ATR below. 0 = every gap qualifies.")
+atrLen     = input.int(14, "ATR length (ATR mode)", minval = 1, group = grpD)
+
+grpB = "2. Box lifetime"
+maxBars    = input.int(100, "Delete unfilled box after (bars)", minval = 1, group = grpB,
+     tooltip = "An unfilled box is removed once this many bars have passed since the gap candle.")
+maxBoxes   = input.int(50, "Maximum boxes on chart", minval = 1, maxval = 500, group = grpB,
+     tooltip = "When the limit is reached, the oldest box is removed before a new box is created, so the configured cap is not exceeded even temporarily.")
+
+grpS = "3. Style"
+bullCol    = input.color(color.new(color.green, 85),  "Bullish gap — fill",                  group = grpS)
+bullMidCol = input.color(color.new(color.teal, 70),   "Bullish gap — fill after midline",    group = grpS)
+bearCol    = input.color(color.new(color.red, 85),    "Bearish gap — fill",                  group = grpS)
+bearMidCol = input.color(color.new(color.orange, 70), "Bearish gap — fill after midline",    group = grpS)
+bullEdge   = input.color(color.new(color.green, 40),  "Bullish gap — border",                group = grpS)
+bearEdge   = input.color(color.new(color.red, 40),    "Bearish gap — border",                group = grpS)
+drawMid    = input.bool(true, "Draw midline", group = grpS)
+midCol     = input.color(color.new(color.gray, 20),   "Midline color",                       group = grpS)
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+type GapBox
+    box   bx        // the drawn box
+    line  md        // the drawn midline (na when midlines are disabled)
+    float top       // upper edge of the gap zone
+    float bot       // lower edge of the gap zone
+    float mid       // midline price (50% of the zone)
+    int   birth     // bar_index of the newer gap candle
+    bool  bull      // true = bullish gap (gap up), false = bearish gap
+    bool  midHit    // true once the midline has been reached (color changed)
+
+var array<GapBox> boxes   = array.new<GapBox>()
+var int           lastPair = na   // bar_index of the last candle pair a box was created for (prevents duplicates on live ticks)
+
+// Delete the box stored at position i (drawing + record).
+f_delete(int i) =>
+    GapBox g = array.get(boxes, i)
+    box.delete(g.bx)
+    if not na(g.md)
+        line.delete(g.md)
+    array.remove(boxes, i)
+
+// ---------------------------------------------------------------------------
+// 1) Manage existing boxes: fill -> delete, expiry -> delete,
+//    midline reached -> recolor, otherwise extend the box to the current bar.
+// ---------------------------------------------------------------------------
+bool filledEvent = false
+bool midEvent    = false
+
+if array.size(boxes) > 0
+    for i = array.size(boxes) - 1 to 0
+        GapBox g = array.get(boxes, i)
+        int  age    = bar_index - g.birth
+        bool filled = g.bull ? low <= g.bot : high >= g.top
+        // Record a first midline touch before any deletion on this bar, so a
+        // bar that reaches both the midline and the far edge still raises the
+        // midline event as well as the fill event.
+        bool midTouched = g.bull ? low <= g.mid : high >= g.mid
+        bool midNow     = not g.midHit and midTouched
+        if midNow
+            g.midHit := true
+            midEvent := true
+        if filled
+            // Price traded back to the far edge of the zone: gap closed.
+            f_delete(i)
+            filledEvent := true
+        else if age >= maxBars
+            // Still unfilled after the configured number of bars.
+            f_delete(i)
+        else
+            if midNow
+                box.set_bgcolor(g.bx, g.bull ? bullMidCol : bearMidCol)
+            box.set_right(g.bx, bar_index)
+            if not na(g.md)
+                line.set_x2(g.md, bar_index)
+
+// ---------------------------------------------------------------------------
+// 2) Detect a new gap and create its box.
+//    Detection always refers to the newer candle itself. With bar-close
+//    confirmation enabled, this section runs only on the candle's confirmed
+//    (closing) execution, so its final high/low and the ATR of that same
+//    candle are used — there is no one-bar look-back delay. "span" is the
+//    distance of the older candle.
+// ---------------------------------------------------------------------------
+bool  detectNow = not confirmBar or barstate.isconfirmed
+int   span    = gapMode == "Previous 2 candles" ? 2 : 1
+float newHi   = high
+float newLo   = low
+float oldHi   = high[span]
+float oldLo   = low[span]
+int   pairBar = bar_index
+
+bool isGapUp = not na(oldHi) and newLo > oldHi
+bool isGapDn = not na(oldLo) and newHi < oldLo
+
+float gapSize  = isGapUp ? newLo - oldHi : isGapDn ? oldLo - newHi : 0.0
+float refPrice = isGapUp ? oldHi : oldLo
+float atrVal   = ta.atr(atrLen)
+float threshold = switch minMode
+    "Percent" => math.abs(refPrice) * minVal / 100.0
+    "Price"   => minVal
+    => minVal == 0.0 ? 0.0 : minVal * atrVal
+
+bool createdBull = false
+bool createdBear = false
+
+bool directionOk = (isGapUp and showBull) or (isGapDn and showBear)
+bool newPair     = na(lastPair) or pairBar != lastPair
+if detectNow and directionOk and newPair and gapSize >= threshold and bar_index >= span
+    bool  bull = isGapUp
+    float top  = bull ? newLo : oldLo
+    float bot  = bull ? oldHi : newHi
+    float mid  = (top + bot) / 2.0
+    int   left = pairBar - span
+    // Enforce the cap before creating the new drawing objects, so the number
+    // of live boxes never exceeds maxBoxes, even temporarily.
+    while array.size(boxes) >= maxBoxes
+        f_delete(0)
+    box bx = box.new(left, top, pairBar, bot, xloc = xloc.bar_index,
+         bgcolor = bull ? bullCol : bearCol,
+         border_color = bull ? bullEdge : bearEdge, border_width = 1)
+    line md = drawMid ? line.new(left, mid, pairBar, mid, xloc = xloc.bar_index,
+         color = midCol, style = line.style_dashed, width = 1) : na
+    array.push(boxes, GapBox.new(bx, md, top, bot, mid, pairBar, bull, false))
+    lastPair    := pairBar
+    createdBull := bull
+    createdBear := not bull
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(createdBull, title = "Colorbox: bullish gap",        message = "Colorbox: a new bullish gap was detected.")
+alertcondition(createdBear, title = "Colorbox: bearish gap",        message = "Colorbox: a new bearish gap was detected.")
+alertcondition(midEvent,    title = "Colorbox: midline touched",    message = "Colorbox: an open gap reached its midline (50%).")
+alertcondition(filledEvent, title = "Colorbox: gap filled",         message = "Colorbox: a gap was fully filled and its box was removed.")
